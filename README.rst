@@ -53,8 +53,31 @@ Using the Ramsurf Program
 --------------------------
 
 The C version mimics the FORTRAN interface and assumes all inputs are described
-in `ram.in`. It outputs two files: `lt.line` as plain text and `tl.grid` using
-the binary format used by FORTRAN.
+in `ram.in`. It outputs three files: `tl.line` as plain text, `tl.grid` (the
+transmission-loss field) and `field.grid` (the complex envelope), both using the
+binary format used by FORTRAN.
+
+Complex field output
+--------------------
+
+`field.grid` stores the complex envelope ``ur = f3*u`` that RAM marches
+internally and that `tl.grid` throws away (it keeps only ``-20 log10|ur|``).
+The layout mirrors `tl.grid`: a leading Fortran record with the integer ``lz``
+(number of depth samples), then one record per output range containing ``2*lz``
+single-precision floats, interleaved as ``(real, imag)`` pairs.
+
+Re-inserting the carrier factored out by the parabolic approximation recovers
+the physical pressure up to the cylindrical-spreading factor,
+
+    p(r,z) = ur(r,z) * exp(i k0 r) / sqrt(r),      k0 = 2 pi freq / c0 .
+
+The ``1/sqrt(r)`` is present only for a 3-D point source; the 2-D line-source
+references (SWKB, spectral fullwave) drop it, and are therefore compared against
+``ur * exp(i k0 r)``. The factor ``f3`` is real (a density/celerity ratio), so
+``arg(ur) = arg(u)``.
+
+See ``SWKB/part_1_examples/ex8_ram_phase.jl`` for a worked example on the
+example-1 lens.
 
 The input format is *the same* as the one described in `readme.orig`::
     
@@ -85,6 +108,27 @@ The input format is *the same* as the one described in `readme.orig`::
     -1 -1
     optional_range # if given, starts a new ssp description starting from this range, otherwise the previous values are valid for all remaining ranges
     [...]
+
+
+Gaussian-beam starter
+---------------------
+
+By default RAM launches an isotropic point/line source at depth ``zs`` with its
+built-in self-starter. Placing a file named ``beam.in`` in the working directory
+(next to ``ram.in``) replaces it with a directional Gaussian beam built as a
+Herglotz (angular-spectrum) superposition of plane waves::
+
+    sigma phi0 z0
+
+``sigma`` is the angular spread in radians, ``phi0`` the central launch angle
+(radians, measured from the x-axis) and ``z0`` the beam-centre depth in metres.
+The initial envelope at ``x = 0`` is
+
+    u(0,z) = int exp(-(phi-phi0)^2/(2 sigma^2)) exp(i k0 (z-z0) sin(phi)) dphi,
+
+with ``k0 = 2 pi freq / c0``. This matches the Gaussian beam used by the SWKB
+reference solutions. If ``beam.in`` is absent, or ``sigma <= 0``, the original
+point-source self-starter is used.
 
 
 Using the Ramsurf Library

@@ -21,6 +21,14 @@ extern "C" {
         float zmax, dz; int ndz; float zmplt; // maximum depth of the whole computational domain (zmax), depth step (dz), ndz (output data at every ndz vertical point at a given range), vertical extent of the domain to output in tl.grid (zmplt).
 
         float c0; int np, ns; float rs; // reference sound speed, number of Pade terms (np), # of stability constraints (ns), radius of stability constraint (rs)
+
+        // Optional Gaussian-beam starter ("beam.in"). When beam != 0 the
+        // isotropic point-source self-starter is replaced by the Herglotz
+        // (angular-spectrum) beam below, evaluated at x = 0:
+        //   u(0,z) = int exp(-(phi-phi0)^2/(2 sigma^2))
+        //              * exp(i k0 (z-z0) sin(phi)) dphi
+        int beam; float beam_sigma, beam_phi0, beam_z0;
+
         float *rsrf, *zsrf; // surface depth: rsrf contains ranges and zsrf the depths. Both terminate by -1
         float *rb, *zb; // bathymetry: rb contains ranges , zb contains bathymetry values. Both teminate by -1
         // array of float arrays. Each subarray contains a profile, as an array of floats containing depth and informations alternatively.
@@ -32,6 +40,7 @@ extern "C" {
     int ramsurf(ramsurf_t const* rsurf, //ram parameters
             int *lz, // number of rows in the NULL terminated ogrid
             float ***ogrid, // the entire range-depth transmission loss field (pointer to the unallocated matrix)
+            float ***ocgrid, // complex envelope field f3*u as interleaved (re,im) pairs, 2*lz floats per row
             FILE *fdline  // transmission loss versus range at a specified receiver depth
             );
 

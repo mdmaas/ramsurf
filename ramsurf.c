@@ -132,6 +132,12 @@ void rsurf_init(ramsurf_t *rsurf, FILE* fs1)
 
     rsurf->mr = mr;
 
+    /* point-source self-starter by default */
+    rsurf->beam = 0;
+    rsurf->beam_sigma = 0.0f;
+    rsurf->beam_phi0 = 0.0f;
+    rsurf->beam_z0 = 0.0f;
+
     /* allocate memory */
     rsurf->rsrf = malloc(sizeof(float)*mr);
     rsurf->zsrf = malloc(sizeof(float)*mr);
@@ -231,6 +237,26 @@ void rsurf_flush(FILE* fd, int lz, ramsurf_t *rsurf, float **output)
     free(output);
 }
 
+// Same Fortran-record layout as rsurf_flush, but each row holds the complex
+// envelope as 2*lz interleaved (real, imag) floats instead of lz magnitudes.
+static
+void rsurf_flush_complex(FILE* fd, int lz, ramsurf_t *rsurf, float **output)
+{
+    int n = sizeof(lz);
+    fwrite((char*)&n, sizeof(n), 1, fd); //FORTRAN record header
+    fwrite((char*)&lz, sizeof(lz), 1, fd);
+    fwrite((char*)&n, sizeof(n), 1, fd); //FORTRAN record footer
+
+    for(float **iter = output; *iter; ++iter) {
+        int n = 2 * lz * sizeof(float);
+        fwrite((char*)&n, sizeof(n), 1, fd); //FORTRAN record header
+        fwrite((char*)(*iter + 1), sizeof(float), 2 * lz, fd);
+        fwrite((char*)&n, sizeof(n), 1, fd); //FORTRAN record footer
+        free(*iter);
+    }
+    free(output);
+}
+
 //
 //     This version of ram handles variable surface height, including
 //     rough surfaces and propagation in beach environments [J. Acoust.
@@ -246,10 +272,38 @@ void rsurf_flush(FILE* fd, int lz, ramsurf_t *rsurf, float **output)
 //     ***** Range-dependent Acoustic Model, Version 1.5b, 19-Oct-00 ****
 //     ******************************************************************
 //
+
+// Read an optional "beam.in" (same directory as ram.in). If present and
+// well-formed, select the Gaussian-beam starter instead of the isotropic
+// point-source self-starter. Format (one line):
+//
+//     sigma phi0 z0
+//
+// where sigma is the angular spread (rad), phi0 the central launch angle
+// (rad, measured from the x-axis) and z0 the beam-centre depth (m).
+static
+void rsurf_init_beam(ramsurf_t *rsurf) {
+    FILE* fb = fopen("beam.in", "r");
+    if(!fb)
+        return;
+    float sigma, phi0, z0;
+    if(fscanf(fb, "%f %f %f", &sigma, &phi0, &z0) == 3 && sigma > 0.0f) {
+        rsurf->beam = 1;
+        rsurf->beam_sigma = sigma;
+        rsurf->beam_phi0 = phi0;
+        rsurf->beam_z0 = z0;
+    } else {
+        fprintf(stderr, "beam.in: expected \"sigma phi0 z0\" with sigma > 0; "
+                        "using the point-source self-starter\n");
+    }
+    fclose(fb);
+}
+
 int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused))) {
     const char ram_in[] = "ram.in";
     const char tl_line[] = "tl.line";
     const char tl_grid[] = "tl.grid";
+    const char field_grid[] = "field.grid";
     FILE* fs1 = fopen(ram_in,"r");
     if(!fs1) {
         perror(ram_in);
@@ -268,6 +322,14 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
         perror(tl_grid);
         return 1;
     }
+    FILE* fs4 = fopen(field_grid,"w+");
+    if(!fs4) {
+        fclose(fs1);
+        fclose(fs2);
+        fclose(fs3);
+        perror(field_grid);
+        return 1;
+    }
 
     int errorCode;
     if(!(errorCode=setjmp(exception_env)))
@@ -275,14 +337,18 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
         ramsurf_t rsurf;
         int lz;
         rsurf_init(&rsurf, fs1);
+        rsurf_init_beam(&rsurf);
         float ** rsurf_output = NULL;
-        ramsurf(&rsurf, &lz, &rsurf_output, fs2);
+        float ** rsurf_coutput = NULL;
+        ramsurf(&rsurf, &lz, &rsurf_output, &rsurf_coutput, fs2);
         rsurf_flush(fs3, lz, &rsurf, rsurf_output);
+        rsurf_flush_complex(fs4, lz, &rsurf, rsurf_coutput);
         rsurf_del(&rsurf);
     }
 
     fclose(fs1);
     fclose(fs2);
     fclose(fs3);
+    fclose(fs4);
     return 0;
 }

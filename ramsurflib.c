@@ -955,10 +955,19 @@ void updat(ramsurf_t const * const rsurf,
 }
 
 //
-//     Output transmission loss.
+//     Output transmission loss and complex field.
+//
+//     `tlg`/`out` receive the usual transmission loss (magnitude only); `cg`/
+//     `outc` receive the complex envelope `ur = f3*u` as interleaved
+//     (real, imag) pairs. The physical field is recovered from `ur` by
+//     re-inserting the carrier that the parabolic approximation factored out:
+//     `p(r,z) = ur(r,z) exp(i k0 r) / sqrt(r)` (the 1/sqrt(r) cylindrical
+//     spreading is only present for a 3-D point source; the 2-D reference
+//     solutions drop it).
 //
 static
 void  outpt(output_t * const out,
+            output_t * const outc,
             FILE * const     fdline,
             size_t const     mz,
             int * const      mdr,
@@ -971,7 +980,8 @@ void  outpt(output_t * const out,
             float const      r,
             float const      f3[mz],
             float const      u[mz][2],
-            float            tlg[mz]) {
+            float            tlg[mz],
+            float            cg[2*mz]) {
     const float eps=1.0e-20;
     //
     fcomplex ur=(1.0f-dir)*(f3[ir-1]*(u[ir-1][0]+I*u[ir-1][1]))+dir*f3[ir]*(u[ir][0]+I*u[ir][1]);
@@ -988,10 +998,13 @@ void  outpt(output_t * const out,
         for(int i=ndz-1; i< nzplt; i+=ndz) {
             ur=(u[i][0]+I*u[i][1])*f3[i];
             tlg[j]=-20*log10((cabs(ur)+eps)/sqrt(r+eps));
+            cg[2*j]  =crealf(ur);
+            cg[2*j+1]=cimagf(ur);
             j=j+1;
             //
         }
        output_push_back(out, tlg, lz, r);
+       output_push_back(outc, cg, 2*lz, r);
     }
     //
 }
@@ -1104,12 +1117,113 @@ void selfs(size_t const mz,
 
 
 //
+//     The Gaussian-beam starter.
+//
+//     RAM's built-in self-starter launches an isotropic line/point source at
+//     depth zs. This alternative injects a directional Herglotz
+//     (angular-spectrum) Gaussian beam, matching the incident field used by
+//     the SWKB reference solutions. The initial envelope at x = 0 is
+//
+//         u(0,z) = int exp(-(phi-phi0)^2/(2 sigma^2))
+//                    * exp(i k0 (z-z0) sin(phi)) dphi,
+//
+//     i.e. the x = 0 slice of the field
+//         u_inc(x,z) = int exp(-(phi-phi0)^2/(2 sigma^2))
+//                        * exp(i k0 (x cos(phi) + (z-z0) sin(phi))) dphi.
+//     Because RAM marches the envelope u = p exp(-i k0 x), this slice is
+//     exactly the correct wide-angle PE initial condition. The field is then
+//     advanced one range step dr so that, like the self-starter, it is ready
+//     at the first output range.
+//
+//     The angular quadrature mirrors SWKB's `gaussian_beam` construction.
+//
+static
+void beams(size_t const mz,
+           size_t const mp,
+           int const    nz,
+           int const    np,
+           int const    ns,
+           int const    iz,
+           float const  sigma,
+           float const  phi0,
+           float const  z0,
+           float const  dr,
+           float const  dz,
+           float const  k0,
+           float        rhob[mz],
+           float        alpw[mz],
+           float        alpb[mz],
+           fcomplex     ksq[mz],
+           fcomplex     ksqw[mz],
+           fcomplex     ksqb[mz],
+           float        f1[mz],
+           float        f2[mz],
+           float        f3[mz],
+           float        u[mz][2],
+           float        r1[mp][mz][2],
+           float        r2[mp][mz][2],
+           float        r3[mp][mz][2],
+           float        s1[mp][mz][2],
+           float        s2[mp][mz][2],
+           float        s3[mp][mz][2],
+           fcomplex     pd1[mp],
+           fcomplex     pd2[mp],
+           int const    izsrf
+          ) {
+    //
+    //     Angular quadrature nodes (uniform). For sigma << 1 the Gaussian
+    //     spectrum is negligible outside [phi0-10 sigma, phi0+10 sigma], as in
+    //     SWKB's gaussian_beam; broad spectra fall back to [0, 2 pi].
+    //
+    const int Nphi = 2001;
+    double lo, hi;
+    if(10.0*sigma < M_PI) {
+        lo = (double)phi0 - 10.0*sigma;
+        hi = (double)phi0 + 10.0*sigma;
+    } else {
+        lo = 0.0;
+        hi = 2.0*M_PI;
+    }
+    double dphi = (Nphi > 1) ? (hi - lo)/(Nphi - 1) : 0.0;
+    double inv2s2 = 1.0/(2.0*(double)sigma*(double)sigma);
+    double k0d = (double)k0, z0d = (double)z0, dzd = (double)dz;
+
+    for(int i=0;i<nz+2;i++) {
+        double zi = (double)i*dzd - z0d;
+        double sr = 0.0, si = 0.0;
+        for(int j=0;j<Nphi;j++) {
+            double phi = lo + (double)j*dphi;
+            double d = phi - (double)phi0;
+            double wgt = exp(-d*d*inv2s2);
+            double phase = k0d*zi*sin(phi);
+            sr += wgt*cos(phase);
+            si += wgt*sin(phase);
+        }
+        u[i][0] = (float)(dphi*sr);
+        u[i][1] = (float)(dphi*si);
+    }
+    //
+    //     Advance one range step to r = dr with the propagation operator,
+    //     exactly as the main marching loop does.
+    //
+    epade(mp, np, ns, 1, k0, dr, (float (*)[2])pd1, (float (*)[2])pd2);
+    matrc(mz, mp, nz, np, iz, dz, k0, rhob, alpw, alpb,
+            (float (*)[2])ksq, (float const (*)[2])ksqw, (float const (*)[2])ksqb,
+            f1, f2, f3, r1, r2, r3, s1, s2, s3,
+            (float (*)[2])pd1, (float (*)[2])pd2, izsrf);
+    solve(mz, mp, nz, np, u, r1, r3, s1, s2, s3);
+    //
+}
+
+
+//
 //     Initialize the parameters, acoustic field, and matrices.
 //
 static
 void setup(ramsurf_t const * const rsurf,
            size_t * const          profl_index,
            output_t * const        out,
+           output_t * const        outc,
            FILE * const            fdline,
            size_t const            mr,
            size_t const            mz,
@@ -1157,6 +1271,7 @@ void setup(ramsurf_t const * const rsurf,
            fcomplex                pd1[mp],
            fcomplex                pd2[mp],
            float                   tlg[mz],
+           float                   cg[2*mz],
            float                   rsrf[mr],
            float                   zsrf[mr],
            int * const             izsrf,
@@ -1236,9 +1351,15 @@ void setup(ramsurf_t const * const rsurf,
     *profl_index=0;
     profl(rsurf, *profl_index, mz, *nz, *dz, *omega, *k0, rp, cw, cb, rhob, attn, 
             alpw, alpb, (float (*)[2])ksqw, (float (*)[2])ksqb);
-    selfs(mz, mp, *nz, *np, *ns, *iz, rsurf->zs, *dr, *dz, *k0, rhob, alpw, alpb, ksq, 
-            ksqw, ksqb, f1, f2, f3, u, r1, r2, r3, s1, s2, s3, pd1, pd2, *izsrf);
-    outpt(out,  fdline,  mz, mdr, *ndr, *ndz, *nzplt, *lz, *ir, *dir, *r, f3, (float const (*)[2])u, tlg);
+    if(rsurf->beam) {
+        beams(mz, mp, *nz, *np, *ns, *iz, rsurf->beam_sigma, rsurf->beam_phi0,
+                rsurf->beam_z0, *dr, *dz, *k0, rhob, alpw, alpb, ksq,
+                ksqw, ksqb, f1, f2, f3, u, r1, r2, r3, s1, s2, s3, pd1, pd2, *izsrf);
+    } else {
+        selfs(mz, mp, *nz, *np, *ns, *iz, rsurf->zs, *dr, *dz, *k0, rhob, alpw, alpb, ksq,
+                ksqw, ksqb, f1, f2, f3, u, r1, r2, r3, s1, s2, s3, pd1, pd2, *izsrf);
+    }
+    outpt(out, outc, fdline, mz, mdr, *ndr, *ndz, *nzplt, *lz, *ir, *dir, *r, f3, (float const (*)[2])u, tlg, cg);
     //
     //     The propagation matrices.
     //
@@ -1260,7 +1381,7 @@ void fix_zmax(float *zmax, float**data) {
     }
 }
 
-int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
+int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, float *** ocgrid, FILE *fdline)
 {
     float k0;
     int errorCode;
@@ -1286,8 +1407,11 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
     output_t out;
     output_init(&out);
 
+    output_t outc;
+    output_init(&outc);
+
     // allocation step 
-    void *scratch = malloc(sizeof(float) * ( 2*mz*3 + 2*mz*mp*3 + 2*mp*2 + mr*4 + mz *10 + 2*mz*1 + 2*mp*mz*3));
+    void *scratch = malloc(sizeof(float) * ( 2*mz*3 + 2*mz*mp*3 + 2*mp*2 + mr*4 + mz *10 + 2*mz*1 + 2*mp*mz*3 + 2*mz));
     void *oscratch = scratch;
     fcomplex (*ksq)[mz] = scratch; scratch += sizeof(float) * 2*mz;
     fcomplex (*ksqb)[mz] = scratch; scratch += sizeof(float) * 2*mz;
@@ -1311,6 +1435,7 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
     float (*f2)[mz]= scratch; scratch += sizeof(float) * mz;
     float (*f3)[mz]= scratch; scratch += sizeof(float) * mz;
     float (*tlg)[mz]= scratch; scratch += sizeof(float) * mz;
+    float (*cg)[2*mz]= scratch; scratch += sizeof(float) * 2*mz;
     float (*u)[mz][2]= scratch; scratch += sizeof(float) * 2*mz;
 
     float (*s1)[mp][mz][2]= scratch; scratch += sizeof(float) * 2*mz*mp;
@@ -1322,7 +1447,7 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
     float omega, r, rp, rs, dr, dz, dir;
     if(!(errorCode=setjmp(exception_env)))
     {
-        setup(rsurf, &profl_index, &out, fdline, mr, mz, mp, &nz, &np, &ns, &mdr, &ndr, &ndz, &iz,
+        setup(rsurf, &profl_index, &out, &outc, fdline, mr, mz, mp, &nz, &np, &ns, &mdr, &ndr, &ndz, &iz,
                 &nzplt, lz, &ib, &ir,
                 &dir, &dr, &dz, &omega, 
                 &k0, &r, &rp, &rs, *rb, *zb, *cw, *cb, *rhob, 
@@ -1330,7 +1455,7 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
                 *f1, *f2, *f3, 
                 *u, 
                 *r1, *r2, *r3, *s1, *s2, *s3, 
-                *pd1, *pd2, *tlg, *rsrf, *zsrf, &izsrf, &isrf);
+                *pd1, *pd2, *tlg, *cg, *rsrf, *zsrf, &izsrf, &isrf);
         //
         //     March the acoustic field out in range.
         //
@@ -1340,12 +1465,15 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, float *** ogrid, FILE *fdline)
                     *r1, *r2, *r3, *s1, *s2, *s3, *pd1, *pd2, *rsrf, *zsrf, &izsrf, &isrf);
             solve(mz, mp, nz, np, *u, *r1, *r3, *s1, *s2, *s3);
             r=r+dr;
-            outpt(&out, fdline, mz,  &mdr, ndr, ndz, nzplt, *lz, ir, dir, r, *f3, (float const (*)[2]) *u, *tlg);
+            outpt(&out, &outc, fdline, mz,  &mdr, ndr, ndz, nzplt, *lz, ir, dir, r, *f3, (float const (*)[2]) *u, *tlg, *cg);
         }
-        if(errorCode)
+        if(errorCode) {
             output_destroy(&out);
-        else
+            output_destroy(&outc);
+        } else {
             *ogrid = output_release(&out);
+            *ocgrid = output_release(&outc);
+        }
     }
 
     // deallocation step 
