@@ -38,6 +38,7 @@
 #include <stddef.h>
 #include <complex.h>
 #include <math.h>
+#include <float.h>
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -69,6 +70,23 @@ static const size_t m = 40;
 
 typedef ram_cplx fcomplex;
 typedef double complex dcomplex;
+
+#if defined(RAMSURF_DOUBLE) && (defined(RAMSURF_PASCAL_TDMA) || defined(RAMSURF_OPENMP_PCR))
+/* PoC switch: replace the fork's factored substitution (matrc LU + solve) with
+   a raw complex tridiagonal solved by an external kernel. Double precision only,
+   where ram_cplx == double complex. Kernel: the OpenMP PCR (pcr_omp.c) when
+   RAMSURF_OPENMP_PCR, otherwise PaScaL_TDMA's serial complex Thomas (tdmas.f90). */
+#define RAMSURF_USE_RAW_TDMA 1
+#endif
+
+#if defined(RAMSURF_OPENMP_PCR)
+extern void pcr_tdma_complex(int n, double complex *a, double complex *b,
+                             double complex *c, double complex *d);
+#elif defined(RAMSURF_USE_RAW_TDMA)
+/* In-place; (a,b,c,d) are consumed on return. */
+extern void tdma_single_(ram_cplx *a, ram_cplx *b, ram_cplx *c, ram_cplx *d, int *n1);
+#endif
+
 
 static jmp_buf exception_env;
 
@@ -830,6 +848,7 @@ void matrc(size_t const mz,
     //
     //     The matrix decomposition.
     //
+#ifndef RAMSURF_USE_RAW_TDMA
     for(int j=0; j<np; j++) {
         for(int i=1;i<nz+1; i++) {
             ram_real denomr = (r2[j][i][0] - (r1[j][i][0] * r3[j][i-1][0] - r1[j][i][1] * r3[j][i-1][1])),
@@ -864,6 +883,7 @@ void matrc(size_t const mz,
 
         }
     }
+#endif
 }
 //
 //     Matrix updates.
@@ -934,7 +954,10 @@ void updat(ramsurf_t const * const rsurf,
     //
     //     Varying profiles.
     //
-    if(r>=*rp){
+    /* Range profiles are specified on independently formed grids. Allow a
+       few ulps at their boundaries rather than delaying a profile by a step. */
+    const ram_real range_eps = sizeof(ram_real) == sizeof(double) ? DBL_EPSILON : FLT_EPSILON;
+    while(r + 8 * range_eps * fmax(fabs(r), fabs(dr)) >= *rp){
         ++*profl_index;
         profl(rsurf, *profl_index, mz, nz, dz, omega, k0, rp, cw, cb, rhob, attn, 
                 alpw, alpb, (ram_real (*)[2])ksqw, (ram_real (*)[2])ksqb);
@@ -1014,8 +1037,54 @@ void  outpt(output_t * const out,
 //
 static
 void solve(size_t mz, size_t mp, int nz, int const np, ram_real u[mz][2], 
-        ram_real r1[mp][mz][2], ram_real r3[mp][mz][2],
+        ram_real r1[mp][mz][2], ram_real r2[mp][mz][2], ram_real r3[mp][mz][2],
         ram_real s1[mp][mz][2], ram_real s2[mp][mz][2], ram_real s3[mp][mz][2]) {
+#ifdef RAMSURF_USE_RAW_TDMA
+    /* PoC: replace the fork's factored substitution with a raw complex
+       tridiagonal solved by an external kernel (see the RAMSURF_USE_RAW_TDMA
+       block near the top). matrc must be compiled *without* its LU (see the
+       `#ifndef RAMSURF_USE_RAW_TDMA` around the decomposition above), so
+       r1,r2,r3 hold the raw tridiagonal and s1,s2,s3 the Pade RHS operator.
+       u[0] and u[nz+1] are the fixed boundary values; the top boundary is
+       absent from the fork's own scheme (r1[1] is unused there), the bottom
+       one is folded into the last row. */
+    /* The fork's solve() must not modify r1,r2,r3 (selfs() solves the same
+       system twice), so tdma_single_ works on private copies. */
+    static ram_cplx *pa_d = NULL, *pa_A = NULL, *pa_B = NULL, *pa_C = NULL;
+    static size_t pa_cap = 0;
+    if (pa_cap < (size_t)(nz + 2)) {
+        pa_cap = (size_t)(nz + 2);
+        pa_d = realloc(pa_d, sizeof(ram_cplx) * pa_cap);
+        pa_A = realloc(pa_A, sizeof(ram_cplx) * pa_cap);
+        pa_B = realloc(pa_B, sizeof(ram_cplx) * pa_cap);
+        pa_C = realloc(pa_C, sizeof(ram_cplx) * pa_cap);
+    }
+    for (int j = 0; j < np; j++) {
+        for (int i = 1; i <= nz; i++) {
+            pa_A[i] = *(ram_cplx *)&r1[j][i][0];
+            pa_B[i] = *(ram_cplx *)&r2[j][i][0];
+            pa_C[i] = *(ram_cplx *)&r3[j][i][0];
+            pa_d[i] = (*(ram_cplx *)&s1[j][i][0]) * (*(ram_cplx *)&u[i-1][0])
+                    + (*(ram_cplx *)&s2[j][i][0]) * (*(ram_cplx *)&u[i  ][0])
+                    + (*(ram_cplx *)&s3[j][i][0]) * (*(ram_cplx *)&u[i+1][0]);
+        }
+        /* Fixed boundary values: only the bottom row couples outward. */
+        pa_d[nz] -= pa_C[nz] * (*(ram_cplx *)&u[nz+1][0]);
+        pa_C[nz] = 0.0;
+        pa_A[1]  = 0.0;   /* r1[1] unused by the fork's scheme */
+
+#ifdef RAMSURF_OPENMP_PCR
+        pcr_tdma_complex(nz, pa_A + 1, pa_B + 1, pa_C + 1, pa_d + 1);
+#else
+        int nn = nz;
+        tdma_single_(pa_A + 1, pa_B + 1, pa_C + 1, pa_d + 1, &nn);
+#endif
+
+        for (int i = 1; i <= nz; i++) {
+            *(ram_cplx *)&u[i][0] = pa_d[i];
+        }
+    }
+#else
     for(int j=0; j<np; j++) {
 
         ram_real vr = s1[j][1][0]*u[0][0]-s1[j][1][1]*u[0][1] + s2[j][1][0]*u[1][0] - s2[j][1][1]*u[1][1] + s3[j][1][0]*u[2][0] - s3[j][1][1]*u[2][1];
@@ -1049,6 +1118,7 @@ void solve(size_t mz, size_t mp, int nz, int const np, ram_real u[mz][2],
         }
         //
     }
+#endif
     //
 }
 
@@ -1103,15 +1173,15 @@ void selfs(size_t const mz,
     pd2[0]=-1.0;
     matrc(mz, mp, nz, 1, iz, dz, k0, rhob, alpw, alpb, (ram_real (*)[2])ksq, (ram_real const (*)[2])ksqw, (ram_real const (*)[2])ksqb, 
             f1, f2, f3, r1, r2, r3, s1, s2, s3, (ram_real (*)[2])pd1, (ram_real (*)[2])pd2, izsrf);
-    solve(mz, mp, nz, 1, u, r1, r3, s1, s2, s3);
-    solve(mz, mp, nz, 1, u, r1, r3, s1, s2, s3);
+    solve(mz, mp, nz, 1, u, r1, r2, r3, s1, s2, s3);
+    solve(mz, mp, nz, 1, u, r1, r2, r3, s1, s2, s3);
     //
     //     Apply the operator [1-X]**2*[1+X]**[-1/4]*exp[I*k0*r*sqrt[1+X]].
     //
     epade(mp, np,ns,2,k0,dr,(ram_real (*)[2])pd1,(ram_real (*)[2])pd2);
     matrc(mz, mp, nz, np, iz, dz, k0, rhob, alpw, alpb, (ram_real (*)[2])ksq, (ram_real const (*)[2])ksqw, (ram_real const (*)[2])ksqb, 
             f1, f2, f3, r1, r2, r3, s1, s2, s3, (ram_real (*)[2])pd1, (ram_real (*)[2])pd2, izsrf);
-    solve(mz, mp, nz, np, u, r1, r3, s1, s2, s3);
+    solve(mz, mp, nz, np, u, r1, r2, r3, s1, s2, s3);
     //
 }
 
@@ -1215,7 +1285,7 @@ void beams(size_t const mz,
             (ram_real (*)[2])ksq, (ram_real const (*)[2])ksqw, (ram_real const (*)[2])ksqb,
             f1, f2, f3, r1, r2, r3, s1, s2, s3,
             (ram_real (*)[2])pd1, (ram_real (*)[2])pd2, izsrf);
-    solve(mz, mp, nz, np, u, r1, r3, s1, s2, s3);
+    solve(mz, mp, nz, np, u, r1, r2, r3, s1, s2, s3);
     //
 }
 
@@ -1355,7 +1425,20 @@ void setup(ramsurf_t const * const rsurf,
     *profl_index=0;
     profl(rsurf, *profl_index, mz, *nz, *dz, *omega, *k0, rp, cw, cb, rhob, attn, 
             alpw, alpb, (ram_real (*)[2])ksqw, (ram_real (*)[2])ksqb);
-    if(rsurf->beam) {
+    if(rsurf->nfield > 0) {
+        // The caller supplies physical pressure. matrc builds f3, whereas
+        // RAM advances the energy-scaled variable pressure/f3.
+        epade(mp, *np, *ns, 1, *k0, *dr, (ram_real (*)[2])pd1, (ram_real (*)[2])pd2);
+        matrc(mz, mp, *nz, *np, *iz, *dz, *k0, rhob, alpw, alpb,
+                (ram_real (*)[2])ksq, (ram_real const (*)[2])ksqw, (ram_real const (*)[2])ksqb,
+                f1, f2, f3, r1, r2, r3, s1, s2, s3,
+                (ram_real (*)[2])pd1, (ram_real (*)[2])pd2, *izsrf);
+        for(int i=0;i<*nz+2;i++) {
+            u[i][0] = rsurf->field_re[i] / f3[i];
+            u[i][1] = rsurf->field_im[i] / f3[i];
+        }
+        solve(mz, mp, *nz, *np, u, r1, r2, r3, s1, s2, s3);
+    } else if(rsurf->beam) {
         beams(mz, mp, *nz, *np, *ns, *iz, rsurf->beam_sigma, rsurf->beam_phi0,
                 rsurf->beam_z0, *dr, *dz, *k0, rhob, alpw, alpb, ksq,
                 ksqw, ksqb, f1, f2, f3, u, r1, r2, r3, s1, s2, s3, pd1, pd2, *izsrf);
@@ -1463,12 +1546,13 @@ int ramsurf(ramsurf_t const* rsurf, int * lz, ram_real *** ogrid, ram_real *** o
         //
         //     March the acoustic field out in range.
         //
+        size_t march_step = 1;
         while (r < rsurf->rmax) {
             updat(rsurf, &profl_index, mr, mz, mp, nz, np, &iz, &ib, dr, dz, omega, k0, r, 
                     &rp, &rs, *rb, *zb, *cw, *cb, *rhob, *attn, *alpw, *alpb, *ksq, *ksqw, *ksqb, *f1, *f2, *f3, 
                     *r1, *r2, *r3, *s1, *s2, *s3, *pd1, *pd2, *rsrf, *zsrf, &izsrf, &isrf);
-            solve(mz, mp, nz, np, *u, *r1, *r3, *s1, *s2, *s3);
-            r=r+dr;
+            solve(mz, mp, nz, np, *u, *r1, *r2, *r3, *s1, *s2, *s3);
+            r=(++march_step)*dr;
             outpt(&out, &outc, fdline, mz,  &mdr, ndr, ndz, nzplt, *lz, ir, dir, r, *f3, (ram_real const (*)[2]) *u, *tlg, *cg);
         }
         if(errorCode) {

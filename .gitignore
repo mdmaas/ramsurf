@@ -9,3 +9,18 @@ install-sh
 missing
 test-driver
 tests/Makefile.in
+
+# Configure and build outputs
+/.deps/
+/Makefile
+/config.guess
+/config.h
+/config.log
+/config.status
+/config.sub
+/libramsurflib.a
+/ram1.5
+/ramsurf
+/*.o
+/stamp-h1
+/tests/Makefile

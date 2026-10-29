@@ -48,6 +48,13 @@ extern "C" {
         // array of ram_real arrays. Each subarray contains a profile, as an array of ram_reals containing depth and informations alternatively.
         ram_real **cw, **cb, **rhob, **attn; // sound speed in water, sound speed in bottom, density of bottom, attenuation of bottom, 
         ram_real *rp; // new profile boundaries (use new profile when a value is reached)
+
+        // Optional externally supplied initial envelope u(0, z_i), evaluated on
+        // the computational grid z_i = i*dz (RAM coordinates, i = 0..nz+1). When
+        // nfield > 0 the self/beam starter is skipped and these arrays are used
+        // instead. This lets a caller inject a launch field that the built-in
+        // angular quadrature cannot resolve (broad spectra / large k0*zmax).
+        int nfield; ram_real *field_re, *field_im;
     } ramsurf_t;
 
 
